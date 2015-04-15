@@ -231,7 +231,11 @@ function detect-minions () {
 #   KUBE_MASTER_IP
 function detect-master () {
   detect-project
-  KUBE_MASTER=${MASTER_NAME}
+  if [[ -z "${KUBE_MASTER-}" ]]; then
+    KUBE_MASTER=$(gcloud preview --project "${PROJECT}" instance-groups \
+      --zone "${ZONE}" instances --group "${MASTER_NAME}-group" list \
+      | cut -d'/' -f11)
+  fi
   if [[ -z "${KUBE_MASTER_IP-}" ]]; then
     KUBE_MASTER_IP=$(gcloud compute instances describe --project "${PROJECT}" --zone "${ZONE}" \
       "${MASTER_NAME}" --fields networkInterfaces[0].accessConfigs[0].natIP \
@@ -348,6 +352,52 @@ function create-route {
     else
         break
     fi
+  done
+}
+
+function create-master-template {
+  detect-project
+  local attempt=0
+  while true; do
+    if ! gcloud compute instance-templates create "${MASTER_NAME}-template" \
+      --address "${KUBE_MASTER_IP}" \
+      --machine-type "${MASTER_SIZE}" \
+      --image-project="${IMAGE_PROJECT}" \
+      --image "${IMAGE}" \
+      --tags "${MASTER_TAG}" \
+      --network "${NETWORK}" \
+      --scopes "storage-ro" "compute-rw" \
+      --can-ip-forward \
+      --metadata-from-file \
+      "startup-script=${KUBE_ROOT}/cluster/gce/configure-vm.sh" \
+      "kube-env=${KUBE_TEMP}/master-kube-env.yaml" \
+      --disk name="${MASTER_NAME}-pd" device-name=master-pd mode=rw boot=no auto-delete=no; then
+      if (( attempt > 5 )); then
+        echo -e "${color_red}Failed to create master instance template $1 ${color_norm}"
+        exit 2
+      fi
+      echo -e "${color_yellow}Attempt $(($attempt+1)) failed to create master instance template. Retrying.${color_norm}"
+      attempt=$(($attempt+1))
+    else
+      break
+    fi
+  done
+}
+
+function create-address {
+  detect-project
+  local REGION=${ZONE%-*}
+  attempt=0
+  until gcloud compute addresses create "${1}" \
+    --project "${PROJECT}" \
+    --region "${REGION}" \
+    --format yaml | awk '{ print $2 }'; do
+    if (( attempt > 5 )); then
+      echo -e "${color_red}Failed to create address $1 ${color_norm}"
+      exit 2
+    fi
+    echo -e "${color_yellow}Attempt $(($attempt+1)) failed to create address $1. Retrying.${color_norm}"
+    attempt=$(($attempt+1))
   done
 }
 
@@ -471,7 +521,7 @@ EOF
 
   if [[ "${master}" != "true" ]]; then
     cat >>$file <<EOF
-KUBERNETES_MASTER_NAME: $(yaml-quote ${MASTER_NAME})
+KUBERNETES_MASTER_NAME: $(yaml-quote ${MASTER_IP})
 ZONE: $(yaml-quote ${ZONE})
 EXTRA_DOCKER_OPTS: $(yaml-quote ${EXTRA_DOCKER_OPTS})
 ENABLE_DOCKER_REGISTRY_CACHE: $(yaml-quote ${ENABLE_DOCKER_REGISTRY_CACHE:-false})
@@ -582,7 +632,17 @@ function kube-up {
   # https://github.com/GoogleCloudPlatform/kubernetes/issues/3168
   KUBELET_TOKEN=$(dd if=/dev/urandom bs=128 count=1 2>/dev/null | base64 | tr -d "=+/" | dd bs=32 count=1 2>/dev/null)
 
-  create-master-instance &
+  # Create the master's IP now, so we can stuff it in a MIG template.
+  KUBE_MASTER_IP=$(create-address "${MASTER_NAME}-ip")
+
+  write-master-env
+  create-master-template
+  gcloud preview managed-instance-groups --zone "${ZONE}" \
+      create "${MASTER_NAME}-group" \
+      --project "${PROJECT}" \
+      --base-instance-name "${MASTER_NAME}" \
+      --size 1 \
+      --template "${MASTER_NAME}-template"
 
   # Create a single firewall rule for all minions.
   create-firewall-rule "${MINION_TAG}-all" "${CLUSTER_IP_RANGE}" "${MINION_TAG}" &
@@ -598,7 +658,7 @@ function kube-up {
 
   # Wait for last batch of jobs
   wait-for-jobs
-  add-instance-metadata "${MASTER_NAME}" "kube-token=${KUBELET_TOKEN}"
+  add-instance-metadata "${KUBE_MASTER}" "kube-token=${KUBELET_TOKEN}"
 
   echo "Creating minions."
 
@@ -644,16 +704,6 @@ function kube-up {
   wait-for-jobs
 
   detect-master
-
-  # Reserve the master's IP so that it can later be transferred to another VM
-  # without disrupting the kubelets. IPs are associated with regions, not zones,
-  # so extract the region name, which is the same as the zone but with the final
-  # dash and characters trailing the dash removed.
-  local REGION=${ZONE%-*}
-  gcloud compute addresses create "${MASTER_NAME}-ip" \
-    --project "${PROJECT}" \
-    --addresses "${KUBE_MASTER_IP}" \
-    --region "${REGION}"
 
   echo "Waiting for cluster initialization."
   echo
