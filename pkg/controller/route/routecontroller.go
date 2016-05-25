@@ -63,7 +63,7 @@ func (rc *RouteController) Run(syncPeriod time.Duration) {
 	// creating a route for it. This is bad.
 	// We should have a watch on node and if we observe a new node (with CIDR?)
 	// trigger reconciliation for that node.
-	go wait.Until(func() {
+	go wait.NonSlidingUntil(func() {
 		if err := rc.reconcileNodeRoutes(); err != nil {
 			glog.Errorf("Couldn't reconcile node routes: %v", err)
 		}
